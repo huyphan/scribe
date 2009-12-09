@@ -156,6 +156,7 @@ class FileStoreBase : public Store {
   bool writeCategory;
   bool createSymlink;
   bool writeStats;
+  bool dateSubDirectory;
 
   // State
   unsigned long currentSize;
@@ -202,6 +203,10 @@ class FileStore : public FileStoreBase {
 
  protected:
   // Implement FileStoreBase virtual function
+  std::string makeDateTimeString(struct tm* creation_time);
+  std::string makeFullFilename(int suffix, struct tm* creation_time,
+                               bool use_full_path = true);
+  int findNewestFile(const std::string& base_filename, struct tm* current_time);
   bool openInternal(bool incrementFilename, struct tm* current_time);
   bool writeMessages(boost::shared_ptr<logentry_vector_t> messages,
                      boost::shared_ptr<FileInterface> write_file =

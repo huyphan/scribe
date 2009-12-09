@@ -133,6 +133,7 @@ FileStoreBase::FileStoreBase(const string& category, const string &type,
   : Store(category, type, multi_category),
     baseFilePath("/tmp"),
     subDirectory(""),
+    dateSubDirectory(false),
     filePath("/tmp"),
     baseFileName(category),
     baseSymlinkName(""),
@@ -253,6 +254,14 @@ void FileStoreBase::configure(pStoreConf configuration) {
     }
   }
 
+  if (configuration->getString("date_sub_directory", tmp)) {
+    if (0 == tmp.compare("yes")) {
+      dateSubDirectory = true;
+    } else {
+      dateSubDirectory = false;
+    }
+  }   
+
   configuration->getString("fs_type", fsType);
 
   configuration->getUnsigned("max_size", maxSize);
@@ -264,6 +273,7 @@ void FileStoreBase::configure(pStoreConf configuration) {
 
 void FileStoreBase::copyCommon(const FileStoreBase *base) {
   subDirectory = base->subDirectory;
+  dateSubDirectory = base->dateSubDirectory;
   chunkSize = base->chunkSize;
   maxSize = base->maxSize;
   maxWriteSize = base->maxWriteSize;
@@ -559,6 +569,53 @@ void FileStore::configure(pStoreConf configuration) {
   addNewlines = inttemp ? true : false;
 }
 
+string FileStore::makeFullFilename(int suffix, struct tm* creation_time,
+                                       bool use_full_path) {
+
+  ostringstream filename;
+
+  if (use_full_path) {
+    filename << filePath << '/';
+  }
+  if (dateSubDirectory) {
+    filename << makeDateTimeString(creation_time) << "/";
+  }
+  filename << makeBaseFilename(creation_time);
+  filename << '_' << setw(5) << setfill('0') << suffix;
+
+  return filename.str();
+}
+
+std::string FileStore::makeDateTimeString(struct tm* creation_time) {
+  ostringstream datetimeString;
+
+  if (rollPeriod != ROLL_NEVER) {
+    datetimeString << creation_time->tm_year + 1900  << '-'
+             << setw(2) << setfill('0') << creation_time->tm_mon + 1 << '-'
+             << setw(2) << setfill('0')  << creation_time->tm_mday;
+
+  }
+  return datetimeString.str();
+}
+
+int FileStore::findNewestFile(const string& base_filename, struct tm* current_time) {
+
+  std::vector<std::string> files = FileInterface::list(filePath + "/" + makeDateTimeString(current_time), fsType);
+
+  int max_suffix = -1;
+  std::string retval;
+  for (std::vector<std::string>::iterator iter = files.begin();
+       iter != files.end();
+       ++iter) {
+
+    int suffix = getFileSuffix(*iter, base_filename);
+    if (suffix > max_suffix) {
+      max_suffix = suffix;
+    }
+  }
+  return max_suffix;
+}
+
 bool FileStore::openInternal(bool incrementFilename, struct tm* current_time) {
   bool success = false;
   struct tm timeinfo;
@@ -570,7 +627,7 @@ bool FileStore::openInternal(bool incrementFilename, struct tm* current_time) {
   }
 
   try {
-    int suffix = findNewestFile(makeBaseFilename(current_time));
+    int suffix = findNewestFile(makeBaseFilename(current_time),current_time);
 
     if (incrementFilename) {
       ++suffix;
@@ -619,12 +676,17 @@ bool FileStore::openInternal(bool incrementFilename, struct tm* current_time) {
       success = writeFile->createDirectory(filePath);
     }
 
+    if (success && dateSubDirectory) {
+      success = writeFile->createDirectory(filePath + "/" + makeDateTimeString(current_time));
+    }
+
     if (!success) {
       LOG_OPER("[%s] Failed to create directory for file <%s>",
                categoryHandled.c_str(), file.c_str());
       setStatus("File open error");
       return false;
     }
+
 
     success = writeFile->openWrite();
 
