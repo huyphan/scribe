@@ -395,10 +395,25 @@ string FileStoreBase::makeBaseFilename(struct tm* creation_time) {
   return filename.str();
 }
 
-// returns the suffix of the newest file matching base_filename
-int FileStoreBase::findNewestFile(const string& base_filename) {
+std::string FileStoreBase::makeDateTimeString(struct tm* creation_time) {
+  ostringstream datetimeString;
 
-  std::vector<std::string> files = FileInterface::list(filePath, fsType);
+  if (rollPeriod != ROLL_NEVER) {
+    datetimeString << creation_time->tm_year + 1900  << '-'
+             << setw(2) << setfill('0') << creation_time->tm_mon + 1 << '-'
+             << setw(2) << setfill('0')  << creation_time->tm_mday;
+
+  }
+  return datetimeString.str();
+}
+
+int FileStoreBase::findNewestFile(const string& base_filename, struct tm* current_time) {
+
+  std::vector<std::string> files;
+  if (dateSubDirectory && current_time != NULL)
+    files = FileInterface::list(filePath + "/" + makeDateTimeString(current_time), fsType);
+  else
+    files = FileInterface::list(filePath, fsType);
 
   int max_suffix = -1;
   std::string retval;
@@ -586,36 +601,6 @@ string FileStore::makeFullFilename(int suffix, struct tm* creation_time,
   return filename.str();
 }
 
-std::string FileStore::makeDateTimeString(struct tm* creation_time) {
-  ostringstream datetimeString;
-
-  if (rollPeriod != ROLL_NEVER) {
-    datetimeString << creation_time->tm_year + 1900  << '-'
-             << setw(2) << setfill('0') << creation_time->tm_mon + 1 << '-'
-             << setw(2) << setfill('0')  << creation_time->tm_mday;
-
-  }
-  return datetimeString.str();
-}
-
-int FileStore::findNewestFile(const string& base_filename, struct tm* current_time) {
-
-  std::vector<std::string> files = FileInterface::list(filePath + "/" + makeDateTimeString(current_time), fsType);
-
-  int max_suffix = -1;
-  std::string retval;
-  for (std::vector<std::string>::iterator iter = files.begin();
-       iter != files.end();
-       ++iter) {
-
-    int suffix = getFileSuffix(*iter, base_filename);
-    if (suffix > max_suffix) {
-      max_suffix = suffix;
-    }
-  }
-  return max_suffix;
-}
-
 bool FileStore::openInternal(bool incrementFilename, struct tm* current_time) {
   bool success = false;
   struct tm timeinfo;
@@ -627,7 +612,8 @@ bool FileStore::openInternal(bool incrementFilename, struct tm* current_time) {
   }
 
   try {
-    int suffix = findNewestFile(makeBaseFilename(current_time),current_time);
+      
+    int suffix = findNewestFile(makeBaseFilename(current_time), current_time);
 
     if (incrementFilename) {
       ++suffix;
@@ -1094,7 +1080,7 @@ bool ThriftFileStore::openInternal(bool incrementFilename, struct tm* current_ti
     current_time = &timeinfo;
   }
 
-  int suffix = findNewestFile(makeBaseFilename(current_time));
+  int suffix = findNewestFile(makeBaseFilename(current_time), current_time);
 
   if (incrementFilename) {
     ++suffix;

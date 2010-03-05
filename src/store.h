@@ -132,8 +132,9 @@ class FileStoreBase : public Store {
                                bool use_full_path = true);
   std::string makeBaseSymlink();
   std::string makeFullSymlink();
+  std::string makeDateTimeString(struct tm* creation_time);
   int  findOldestFile(const std::string& base_filename);
-  int  findNewestFile(const std::string& base_filename);
+  int  findNewestFile(const std::string& base_filename, struct tm* current_time);
   int  getFileSuffix(const std::string& filename,
                      const std::string& base_filename);
   void setHostNameSubDir();
@@ -203,10 +204,8 @@ class FileStore : public FileStoreBase {
 
  protected:
   // Implement FileStoreBase virtual function
-  std::string makeDateTimeString(struct tm* creation_time);
   std::string makeFullFilename(int suffix, struct tm* creation_time,
                                bool use_full_path = true);
-  int findNewestFile(const std::string& base_filename, struct tm* current_time);
   bool openInternal(bool incrementFilename, struct tm* current_time);
   bool writeMessages(boost::shared_ptr<logentry_vector_t> messages,
                      boost::shared_ptr<FileInterface> write_file =
