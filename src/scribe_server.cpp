@@ -41,10 +41,10 @@ shared_ptr<scribeHandler> g_Handler;
 #define DEFAULT_CHECK_PERIOD       5
 #define DEFAULT_MAX_MSG_PER_SECOND 100000
 #define DEFAULT_MAX_QUEUE_SIZE     5000000
-#define DEFAULT_SERVER_THREADS     1
+#define DEFAULT_SERVER_THREADS     3
 
 void print_usage(const char* program_name) {
-  cout << "Usage: " << program_name << " [-p port] [-c config_file]";
+  cout << "Usage: " << program_name << " [-p port] [-c config_file]" << endl;
 }
 
 int main(int argc, char **argv) {

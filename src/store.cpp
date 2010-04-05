@@ -148,7 +148,7 @@ FileStoreBase::FileStoreBase(const string& category, const string &type,
     writeMeta(false),
     writeCategory(false),
     createSymlink(true),
-    writeStats(true),
+    writeStats(false),
     currentSize(0),
     lastRollTime(0),
     eventsWritten(0) {
@@ -1162,14 +1162,10 @@ bool ThriftFileStore::openInternal(bool incrementFilename, struct tm* current_ti
 
 bool ThriftFileStore::createFileDirectory () {
   try {
-    boost::filesystem::create_directory(baseFilePath);
-
-    // If we created a subdirectory, we need to create two directories
-    if (!subDirectory.empty()) {
-      boost::filesystem::create_directory(filePath);
-    }
+    boost::filesystem::create_directories(filePath);
   }catch(std::exception const& e) {
-    LOG_OPER("Exception < %s > trying to create directory", e.what());
+    LOG_OPER("Exception < %s > in ThriftFileStore::createFileDirectory for path %s",
+      e.what(),filePath.c_str());
     return false;
   }
   return true;
