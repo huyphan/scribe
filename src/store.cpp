@@ -299,7 +299,8 @@ void FileStoreBase::copyCommon(const FileStoreBase *base) {
     filePath += "/" + subDirectory;
   }
 
-  baseFileName = categoryHandled;
+  baseFileName = base->baseFileName;
+//  baseFIileName = categoryHandled;
 }
 
 bool FileStoreBase::open() {
