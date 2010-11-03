@@ -19,6 +19,7 @@
 // @author James Wang
 // @author Jason Sobel
 // @author Anthony Giardullo
+// @author John Song
 
 #include "common.h"
 #include "scribe_server.h"
@@ -27,8 +28,8 @@ using namespace std;
 using namespace boost;
 using namespace scribe::thrift;
 
-#define DEFAULT_TARGET_WRITE_SIZE  16384
-#define DEFAULT_MAX_WRITE_INTERVAL 10
+#define DEFAULT_TARGET_WRITE_SIZE  16384LL
+#define DEFAULT_MAX_WRITE_INTERVAL 1
 
 void* threadStatic(void *this_ptr) {
   StoreQueue *queue_ptr = (StoreQueue*)this_ptr;
@@ -49,14 +50,15 @@ StoreQueue::StoreQueue(const string& type, const string& category,
     maxWriteInterval(DEFAULT_MAX_WRITE_INTERVAL),
     mustSucceed(true) {
 
-  store = Store::createStore(type, category, false, multiCategory);
+  store = Store::createStore(this, type, category,
+                            false, multiCategory);
   if (!store) {
     throw std::runtime_error("createStore failed in StoreQueue constructor. Invalid type?");
   }
   storeInitCommon();
 }
 
-StoreQueue::StoreQueue(const shared_ptr<StoreQueue> example,
+StoreQueue::StoreQueue(const boost::shared_ptr<StoreQueue> example,
                        const std::string &category)
   : msgQueueSize(0),
     hasWork(false),
@@ -84,16 +86,6 @@ StoreQueue::~StoreQueue() {
     pthread_mutex_destroy(&hasWorkMutex);
     pthread_cond_destroy(&hasWorkCond);
   }
-}
-
-// WARNING: the number could change after you check this, so don't
-// expect it to be exact. Use for hueristics ONLY.
-unsigned long StoreQueue::getSize() {
-  unsigned long retval;
-  pthread_mutex_lock(&msgMutex);
-  retval = msgQueueSize;
-  pthread_mutex_unlock(&msgMutex);
-  return retval;
 }
 
 void StoreQueue::addMessage(boost::shared_ptr<LogEntry> entry) {
@@ -202,7 +194,6 @@ std::string StoreQueue::getBaseType() {
 
 void StoreQueue::threadMember() {
   LOG_OPER("store thread starting");
-
   if (isModel) {
     LOG_OPER("ERROR: store thread starting on model store, exiting");
     return;
@@ -219,9 +210,7 @@ void StoreQueue::threadMember() {
   time_t last_handle_messages;
   time(&last_handle_messages);
 
-  // initialize absolute timestamp
   struct timespec abs_timeout;
-  memset(&abs_timeout, 0, sizeof(struct timespec));
 
   bool stop = false;
   bool open = false;
@@ -254,11 +243,10 @@ void StoreQueue::threadMember() {
     }
 
     // handle periodic tasks
-    //
     time_t this_loop;
     time(&this_loop);
-    if (!stop && open && this_loop - last_periodic_check > checkPeriod) {
-      store->periodicCheck();
+    if (!stop && ((this_loop - last_periodic_check) >= checkPeriod)) {
+      if (open) store->periodicCheck();
       last_periodic_check = this_loop;
     }
 
@@ -270,7 +258,7 @@ void StoreQueue::threadMember() {
     // handle messages if stopping, enough time has passed, or queue is large
     //
     if (stop ||
-        (this_loop - last_handle_messages > maxWriteInterval) ||
+        (this_loop - last_handle_messages >= maxWriteInterval) ||
         msgQueueSize >= targetWriteSize) {
 
       if (failedMessages) {
@@ -301,10 +289,8 @@ void StoreQueue::threadMember() {
     if (!stop) {
       // set timeout to when we need to handle messages or do a periodic check
       abs_timeout.tv_sec = min(last_periodic_check + checkPeriod,
-                               last_handle_messages + maxWriteInterval);
-
-      // must wait until after this time
-      abs_timeout.tv_sec++;
+          last_handle_messages + maxWriteInterval);
+      abs_timeout.tv_nsec = 0;
 
       // wait until there's some work to do or we timeout
       pthread_mutex_lock(&hasWorkMutex);
@@ -330,12 +316,12 @@ void StoreQueue::processFailedMessages(shared_ptr<logentry_vector_t> messages) {
 
     LOG_OPER("[%s] WARNING: Re-queueing %lu messages!",
              categoryHandled.c_str(), messages->size());
-    g_Handler->incrementCounter("requeue", messages->size());
+    g_Handler->incCounter(categoryHandled, "requeue", messages->size());
   } else {
     // record messages as being lost
     LOG_OPER("[%s] WARNING: Lost %lu messages!",
              categoryHandled.c_str(), messages->size());
-    g_Handler->incrementCounter("lost", messages->size());
+    g_Handler->incCounter(categoryHandled, "lost", messages->size());
   }
 }
 
@@ -354,15 +340,19 @@ void StoreQueue::storeInitCommon() {
 
 void StoreQueue::configureInline(pStoreConf configuration) {
   // Constructor defaults are fine if these don't exist
-  configuration->getUnsigned("target_write_size", (unsigned long&) targetWriteSize);
-  configuration->getUnsigned("max_write_interval", (unsigned long&) maxWriteInterval);
+  configuration->getUnsignedLongLong("target_write_size", targetWriteSize);
+  configuration->getUnsigned("max_write_interval",
+                            (unsigned long&) maxWriteInterval);
+  if (maxWriteInterval == 0) {
+    maxWriteInterval = 1;
+  }
 
   string tmp;
   if (configuration->getString("must_succeed", tmp) && tmp == "no") {
     mustSucceed = false;
   }
 
-  store->configure(configuration);
+  store->configure(configuration, pStoreConf());
 }
 
 void StoreQueue::openInline() {

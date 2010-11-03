@@ -1,4 +1,4 @@
-#!/usr/local/bin/thrift --cpp --php
+#!/usr/local/bin/thrift --gen cpp:pure_enums --gen php
 
 ##  Copyright (c) 2007-2008 Facebook
 ##
@@ -20,6 +20,8 @@
 include "fb303/if/fb303.thrift"
 
 namespace cpp scribe.thrift
+namespace java scribe.thrift
+namespace perl Scribe.Thrift
 
 enum ResultCode
 {

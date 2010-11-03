@@ -22,10 +22,12 @@
 // @author Avinash Lakshman
 // @author Anthony Giardullo
 // @author Jan Oravec
+// @author John Song
 
+#include <algorithm>
 #include "common.h"
 #include "scribe_server.h"
-#include "thrift/transport/TSimpleFileTransport.h"
+#include "network_dynamic_config.h"
 
 using namespace std;
 using namespace boost;
@@ -36,58 +38,100 @@ using namespace apache::thrift::transport;
 using namespace apache::thrift::server;
 using namespace scribe::thrift;
 
-#define DEFAULT_FILESTORE_MAX_SIZE               1000000000
-#define DEFAULT_FILESTORE_MAX_WRITE_SIZE         1000000
-#define DEFAULT_FILESTORE_ROLL_HOUR              1
-#define DEFAULT_FILESTORE_ROLL_MINUTE            15
-#define DEFAULT_BUFFERSTORE_MAX_QUEUE_LENGTH     2000000
-#define DEFAULT_BUFFERSTORE_SEND_RATE            1
-#define DEFAULT_BUFFERSTORE_AVG_RETRY_INTERVAL   300
-#define DEFAULT_BUFFERSTORE_RETRY_INTERVAL_RANGE 60
-#define DEFAULT_BUCKETSTORE_DELIMITER            ':'
-#define DEFAULT_NETWORKSTORE_CACHE_TIMEOUT       300
+#define DEFAULT_FILESTORE_MAX_SIZE                1000000000
+#define DEFAULT_FILESTORE_MAX_WRITE_SIZE          1000000
+#define DEFAULT_FILESTORE_ROLL_HOUR               1
+#define DEFAULT_FILESTORE_ROLL_MINUTE             15
+#define DEFAULT_BUFFERSTORE_SEND_RATE             1
+#define DEFAULT_BUFFERSTORE_AVG_RETRY_INTERVAL    300
+#define DEFAULT_BUFFERSTORE_RETRY_INTERVAL_RANGE  60
+#define DEFAULT_BUCKETSTORE_DELIMITER             ':'
+#define DEFAULT_NETWORKSTORE_CACHE_TIMEOUT        300
+#define DEFAULT_BUFFERSTORE_BYPASS_MAXQSIZE_RATIO 0.75
+
+// magic threshold
+#define DEFAULT_NETWORKSTORE_DUMMY_THRESHOLD      4096
+
+// Parameters for adaptive_backoff
+#define DEFAULT_MIN_RETRY                         5
+#define DEFAULT_MAX_RETRY                         100
+#define DEFAULT_RANDOM_OFFSET_RANGE               20
+const double MULT_INC_FACTOR =                    1.414; //sqrt(2)
+#define ADD_DEC_FACTOR                            2
+#define CONT_SUCCESS_THRESHOLD                    1
 
 ConnPool g_connPool;
 
 const string meta_logfile_prefix = "scribe_meta<new_logfile>: ";
 
+// Checks if we should try sending a dummy Log in the n/w store
+bool shouldSendDummy(boost::shared_ptr<logentry_vector_t> messages) {
+  size_t size = 0;
+  for (logentry_vector_t::iterator iter = messages->begin();
+      iter != messages->end(); ++iter) {
+    size += (**iter).message.size();
+    if (size > DEFAULT_NETWORKSTORE_DUMMY_THRESHOLD) {
+      return true;
+    }
+  }
+  return false;
+}
+
+
 boost::shared_ptr<Store>
-Store::createStore(const string& type, const string& category,
-                   bool readable, bool multi_category) {
+Store::createStore(StoreQueue* storeq, const string& type,
+                   const string& category, bool readable,
+                   bool multi_category) {
   if (0 == type.compare("file")) {
-    return shared_ptr<Store>(new FileStore(category, multi_category, readable));
+    return shared_ptr<Store>(new FileStore(storeq, category, multi_category,
+                                          readable));
   } else if (0 == type.compare("buffer")) {
-    return shared_ptr<Store>(new BufferStore(category, multi_category));
+    return shared_ptr<Store>(new BufferStore(storeq,category, multi_category));
   } else if (0 == type.compare("network")) {
-    return shared_ptr<Store>(new NetworkStore(category, multi_category));
+    return shared_ptr<Store>(new NetworkStore(storeq, category,
+                                              multi_category));
   } else if (0 == type.compare("bucket")) {
-    return shared_ptr<Store>(new BucketStore(category, multi_category));
+    return shared_ptr<Store>(new BucketStore(storeq, category,
+                                            multi_category));
   } else if (0 == type.compare("thriftfile")) {
-    return shared_ptr<Store>(new ThriftFileStore(category, multi_category));
+    return shared_ptr<Store>(new ThriftFileStore(storeq, category,
+                                                multi_category));
   } else if (0 == type.compare("null")) {
-    return shared_ptr<Store>(new NullStore(category, multi_category));
+    return shared_ptr<Store>(new NullStore(storeq, category, multi_category));
   } else if (0 == type.compare("multi")) {
-    return shared_ptr<Store>(new MultiStore(category, multi_category));
+    return shared_ptr<Store>(new MultiStore(storeq, category, multi_category));
   } else if (0 == type.compare("category")) {
-    return shared_ptr<Store>(new CategoryStore(category, multi_category));
+    return shared_ptr<Store>(new CategoryStore(storeq, category,
+                                              multi_category));
   } else if (0 == type.compare("multifile")) {
-    return shared_ptr<Store>(new MultiFileStore(category, multi_category));
+    return shared_ptr<Store>(new MultiFileStore(storeq, category,
+                                                multi_category));
   } else if (0 == type.compare("thriftmultifile")) {
-    return shared_ptr<Store>(new ThriftMultiFileStore(category, multi_category));
+    return shared_ptr<Store>(new ThriftMultiFileStore(storeq, category,
+                                                      multi_category));
   } else {
     return shared_ptr<Store>();
   }
 }
 
-Store::Store(const string& category, const string &type, bool multi_category)
+Store::Store(StoreQueue* storeq,
+             const string& category,
+             const string &type,
+             bool multi_category)
   : categoryHandled(category),
     multiCategory(multi_category),
-    storeType(type) {
+    storeType(type),
+    storeQueue(storeq) {
   pthread_mutex_init(&statusMutex, NULL);
 }
 
 Store::~Store() {
   pthread_mutex_destroy(&statusMutex);
+}
+
+void Store::configure(pStoreConf configuration, pStoreConf parent) {
+  storeConf = configuration;
+  storeConf->setParent(parent);
 }
 
 void Store::setStatus(const std::string& new_status) {
@@ -105,22 +149,26 @@ std::string Store::getStatus() {
 
 bool Store::readOldest(/*out*/ boost::shared_ptr<logentry_vector_t> messages,
                        struct tm* now) {
-  LOG_OPER("[%s] ERROR: attempting to read from a write-only store", categoryHandled.c_str());
+  LOG_OPER("[%s] ERROR: attempting to read from a write-only store",
+          categoryHandled.c_str());
   return false;
 }
 
 bool Store::replaceOldest(boost::shared_ptr<logentry_vector_t> messages,
                           struct tm* now) {
-  LOG_OPER("[%s] ERROR: attempting to read from a write-only store", categoryHandled.c_str());
+  LOG_OPER("[%s] ERROR: attempting to read from a write-only store",
+          categoryHandled.c_str());
   return false;
 }
 
 void Store::deleteOldest(struct tm* now) {
-   LOG_OPER("[%s] ERROR: attempting to read from a write-only store", categoryHandled.c_str());
+   LOG_OPER("[%s] ERROR: attempting to read from a write-only store",
+            categoryHandled.c_str());
 }
 
 bool Store::empty(struct tm* now) {
-  LOG_OPER("[%s] ERROR: attempting to read from a write-only store", categoryHandled.c_str());
+  LOG_OPER("[%s] ERROR: attempting to read from a write-only store",
+            categoryHandled.c_str());
   return true;
 }
 
@@ -128,9 +176,10 @@ const std::string& Store::getType() {
   return storeType;
 }
 
-FileStoreBase::FileStoreBase(const string& category, const string &type,
-                             bool multi_category)
-  : Store(category, type, multi_category),
+FileStoreBase::FileStoreBase(StoreQueue* storeq,
+                             const string& category,
+                             const string &type, bool multi_category)
+  : Store(storeq, category, type, multi_category),
     baseFilePath("/tmp"),
     subDirectory(""),
     dateSubDirectory(false),
@@ -149,6 +198,7 @@ FileStoreBase::FileStoreBase(const string& category, const string &type,
     writeCategory(false),
     createSymlink(true),
     writeStats(false),
+    rotateOnReopen(false),
     currentSize(0),
     lastRollTime(0),
     eventsWritten(0) {
@@ -157,7 +207,8 @@ FileStoreBase::FileStoreBase(const string& category, const string &type,
 FileStoreBase::~FileStoreBase() {
 }
 
-void FileStoreBase::configure(pStoreConf configuration) {
+void FileStoreBase::configure(pStoreConf configuration, pStoreConf parent) {
+  Store::configure(configuration, parent);
 
   // We can run using defaults for all of these, but there are
   // a couple of suspicious things we warn about.
@@ -177,7 +228,9 @@ void FileStoreBase::configure(pStoreConf configuration) {
 
 
   if (!configuration->getString("base_filename", baseFileName)) {
-    LOG_OPER("[%s] WARNING: Bad config - no base_filename specified for file store", categoryHandled.c_str());
+    LOG_OPER(
+        "[%s] WARNING: Bad config - no base_filename specified for file store",
+        categoryHandled.c_str());
   }
 
   // check if symlink name is optionally specified
@@ -221,8 +274,8 @@ void FileStoreBase::configure(pStoreConf configuration) {
 
       if (!ok) {
         rollPeriod = ROLL_NEVER;
-        LOG_OPER("[%s] WARNING: Bad config - invalid format of rotate_period,"
-                 " rotations disabled", categoryHandled.c_str());
+        LOG_OPER("[%s] WARNING: Bad config - invalid format of rotate_period, rotations disabled",
+            categoryHandled.c_str());
       }
     }
   }
@@ -265,10 +318,21 @@ void FileStoreBase::configure(pStoreConf configuration) {
   configuration->getString("fs_type", fsType);
 
   configuration->getUnsigned("max_size", maxSize);
+  if(0 == maxSize) {
+    maxSize = ULONG_MAX;
+  }
   configuration->getUnsigned("max_write_size", maxWriteSize);
   configuration->getUnsigned("rotate_hour", rollHour);
   configuration->getUnsigned("rotate_minute", rollMinute);
   configuration->getUnsigned("chunk_size", chunkSize);
+
+  if (configuration->getString("rotate_on_reopen", tmp)) {
+    if (0 == tmp.compare("yes")) {
+      rotateOnReopen = true;
+    } else {
+      rotateOnReopen = false;
+    }
+  }
 }
 
 void FileStoreBase::copyCommon(const FileStoreBase *base) {
@@ -287,6 +351,7 @@ void FileStoreBase::copyCommon(const FileStoreBase *base) {
   createSymlink = base->createSymlink;
   baseSymlinkName = base->baseSymlinkName;
   writeStats = base->writeStats;
+  rotateOnReopen = base->rotateOnReopen;
 
   /*
    * append the category name to the base file path and change the
@@ -304,9 +369,10 @@ void FileStoreBase::copyCommon(const FileStoreBase *base) {
 }
 
 bool FileStoreBase::open() {
-  return openInternal(false, NULL);
+  return openInternal(rotateOnReopen, NULL);
 }
 
+// Decides whether conditions are sufficient for us to roll files
 void FileStoreBase::periodicCheck() {
 
   time_t rawtime = time(NULL);
@@ -347,7 +413,8 @@ void FileStoreBase::rotateFile(time_t currentTime) {
 
   LOG_OPER("[%s] %d:%d rotating file <%s> old size <%lu> max size <%lu>",
            categoryHandled.c_str(), timeinfo.tm_hour, timeinfo.tm_min,
-           makeBaseFilename(&timeinfo).c_str(), currentSize, maxSize);
+           makeBaseFilename(&timeinfo).c_str(), currentSize,
+           maxSize == ULONG_MAX ? 0 : maxSize);
 
   printStats();
   openInternal(true, &timeinfo);
@@ -449,7 +516,8 @@ int FileStoreBase::findOldestFile(const string& base_filename) {
   return min_suffix;
 }
 
-int FileStoreBase::getFileSuffix(const string& filename, const string& base_filename) {
+int FileStoreBase::getFileSuffix(const string& filename,
+                                const string& base_filename) {
   int suffix = -1;
   string::size_type suffix_pos = filename.rfind('_');
 
@@ -473,7 +541,8 @@ void FileStoreBase::printStats() {
   string filename(filePath);
   filename += "/scribe_stats";
 
-  boost::shared_ptr<FileInterface> stats_file = FileInterface::createFileInterface(fsType, filename);
+  boost::shared_ptr<FileInterface> stats_file =
+      FileInterface::createFileInterface(fsType, filename);
   if (!stats_file ||
       !stats_file->createDirectory(filePath) ||
       !stats_file->openWrite()) {
@@ -507,7 +576,8 @@ unsigned long FileStoreBase::bytesToPad(unsigned long next_message_length,
                                         unsigned long chunk_size) {
 
   if (chunk_size > 0) {
-    unsigned long space_left_in_chunk = chunk_size - current_file_size % chunk_size;
+    unsigned long space_left_in_chunk =
+              chunk_size - current_file_size % chunk_size;
     if (next_message_length > space_left_in_chunk) {
       return space_left_in_chunk;
     } else {
@@ -543,18 +613,20 @@ void FileStoreBase::setHostNameSubDir() {
   }
 }
 
-FileStore::FileStore(const string& category, bool multi_category,
-                     bool is_buffer_file)
-  : FileStoreBase(category, "file", multi_category),
+FileStore::FileStore(StoreQueue* storeq,
+                     const string& category,
+                     bool multi_category, bool is_buffer_file)
+  : FileStoreBase(storeq, category, "file", multi_category),
     isBufferFile(is_buffer_file),
-    addNewlines(false) {
+    addNewlines(false),
+    lostBytes_(0) {
 }
 
 FileStore::~FileStore() {
 }
 
-void FileStore::configure(pStoreConf configuration) {
-  FileStoreBase::configure(configuration);
+void FileStore::configure(pStoreConf configuration, pStoreConf parent) {
+  FileStoreBase::configure(configuration, parent);
 
   // We can run using defaults for all of these, but there are
   // a couple of suspicious things we warn about.
@@ -705,7 +777,7 @@ bool FileStore::openInternal(bool incrementFilename, struct tm* current_time) {
       setStatus("");
     }
 
-  } catch(std::exception const& e) {
+  } catch(const std::exception& e) {
     LOG_OPER("[%s] Failed to create/open file of type <%s> for writing",
              categoryHandled.c_str(), fsType.c_str());
     LOG_OPER("Exception: %s", e.what());
@@ -733,7 +805,8 @@ void FileStore::flush() {
 }
 
 shared_ptr<Store> FileStore::copy(const std::string &category) {
-  FileStore *store = new FileStore(category, multiCategory, isBufferFile);
+  FileStore *store = new FileStore(storeQueue, category, multiCategory,
+                                   isBufferFile);
   shared_ptr<Store> copied = shared_ptr<Store>(store);
 
   store->addNewlines = addNewlines;
@@ -744,8 +817,11 @@ shared_ptr<Store> FileStore::copy(const std::string &category) {
 bool FileStore::handleMessages(boost::shared_ptr<logentry_vector_t> messages) {
 
   if (!isOpen()) {
-    LOG_OPER("[%s] File failed to open FileStore::handleMessages()", categoryHandled.c_str());
-    return false;
+    if (!open()) {
+      LOG_OPER("[%s] File failed to open FileStore::handleMessages()",
+               categoryHandled.c_str());
+      return false;
+    }
   }
 
   // write messages to current file
@@ -829,7 +905,7 @@ bool FileStore::writeMessages(boost::shared_ptr<logentry_vector_t> messages,
       num_buffered++;
 
       // Write buffer if processing last message or if larger than allowed
-      if ((currentSize + current_size_buffered > max_write_size && maxSize != 0) ||
+      if ((current_size_buffered > max_write_size && maxSize != 0) ||
           messages->end() == iter + 1 ) {
         if (!write_file->write(write_buffer)) {
           LOG_OPER("[%s] File store failed to write (%lu) messages to file",
@@ -852,7 +928,7 @@ bool FileStore::writeMessages(boost::shared_ptr<logentry_vector_t> messages,
         write_file = writeFile;
       }
     }
-  } catch (std::exception const& e) {
+  } catch (const std::exception& e) {
     LOG_OPER("[%s] File store failed to write. Exception: %s",
              categoryHandled.c_str(), e.what());
     success = false;
@@ -872,6 +948,8 @@ bool FileStore::writeMessages(boost::shared_ptr<logentry_vector_t> messages,
   return success;
 }
 
+// Deletes the oldest file
+// currently gets invoked from within a bufferstore
 void FileStore::deleteOldest(struct tm* now) {
 
   int index = findOldestFile(makeBaseFilename(now));
@@ -880,6 +958,10 @@ void FileStore::deleteOldest(struct tm* now) {
   }
   shared_ptr<FileInterface> deletefile = FileInterface::createFileInterface(fsType,
                                             makeFullFilename(index, now));
+  if (lostBytes_) {
+    g_Handler->incCounter(categoryHandled, "bytes lost", lostBytes_);
+    lostBytes_ = 0;
+  }
   deletefile->deleteFile();
 }
 
@@ -922,6 +1004,8 @@ bool FileStore::replaceOldest(boost::shared_ptr<logentry_vector_t> messages,
 bool FileStore::readOldest(/*out*/ boost::shared_ptr<logentry_vector_t> messages,
                            struct tm* now) {
 
+  long loss;
+
   int index = findOldestFile(makeBaseFilename(now));
   if (index < 0) {
     // This isn't an error. It's legit to call readOldest when there aren't any
@@ -930,15 +1014,18 @@ bool FileStore::readOldest(/*out*/ boost::shared_ptr<logentry_vector_t> messages
   }
   std::string filename = makeFullFilename(index, now);
 
-  shared_ptr<FileInterface> infile = FileInterface::createFileInterface(fsType, filename, isBufferFile);
+  shared_ptr<FileInterface> infile = FileInterface::createFileInterface(fsType,
+                                              filename, isBufferFile);
 
   if (!infile->openRead()) {
-    LOG_OPER("[%s] Failed to open file <%s> for reading", categoryHandled.c_str(), filename.c_str());
+    LOG_OPER("[%s] Failed to open file <%s> for reading",
+            categoryHandled.c_str(), filename.c_str());
     return false;
   }
 
+  uint32_t bsize = 0;
   std::string message;
-  while (infile->readNext(message)) {
+  while ((loss = infile->readNext(message)) > 0) {
     if (!message.empty()) {
       logentry_ptr_t entry = logentry_ptr_t(new LogEntry);
 
@@ -947,9 +1034,11 @@ bool FileStore::readOldest(/*out*/ boost::shared_ptr<logentry_vector_t> messages
         // get category without trailing \n
         entry->category = message.substr(0, message.length() - 1);
 
-        if (!infile->readNext(message)) {
-          LOG_OPER("[%s] category not stored with message <%s>",
-                   categoryHandled.c_str(), entry->category.c_str());
+        if ((loss = infile->readNext(message)) <= 0) {
+          LOG_OPER("[%s] category not stored with message <%s> "
+              "corruption?, incompatible config change?",
+              categoryHandled.c_str(), entry->category.c_str());
+          break;
         }
       } else {
         entry->category = categoryHandled;
@@ -958,17 +1047,23 @@ bool FileStore::readOldest(/*out*/ boost::shared_ptr<logentry_vector_t> messages
       entry->message = message;
 
       messages->push_back(entry);
+      bsize += entry->category.size();
+      bsize += entry->message.size();
     }
+  }
+  if (loss < 0) {
+    lostBytes_ = -loss;
+  } else {
+    lostBytes_ = 0;
   }
   infile->close();
 
-  LOG_OPER("[%s] successfully read <%lu> entries from file <%s>",
-        categoryHandled.c_str(), messages->size(), filename.c_str());
+  LOG_OPER("[%s] read <%lu> entries of <%d> bytes from file <%s>",
+        categoryHandled.c_str(), messages->size(), bsize, filename.c_str());
   return true;
 }
 
 bool FileStore::empty(struct tm* now) {
-
   std::vector<std::string> files = FileInterface::list(filePath, fsType);
 
   std::string base_filename = makeBaseFilename(now);
@@ -978,18 +1073,22 @@ bool FileStore::empty(struct tm* now) {
     int suffix =  getFileSuffix(*iter, base_filename);
     if (-1 != suffix) {
       std::string fullname = makeFullFilename(suffix, now);
-      shared_ptr<FileInterface> file = FileInterface::createFileInterface(fsType, fullname);
+      shared_ptr<FileInterface> file = FileInterface::createFileInterface(fsType,
+                                                                      fullname);
       if (file->fileSize()) {
         return false;
       }
     } // else it doesn't match the filename for this store
   }
   return true;
+
 }
 
 
-ThriftFileStore::ThriftFileStore(const std::string& category, bool multi_category)
-  : FileStoreBase(category, "thriftfile", multi_category),
+ThriftFileStore::ThriftFileStore(StoreQueue* storeq,
+                                 const std::string& category,
+                                 bool multi_category)
+  : FileStoreBase(storeq, category, "thriftfile", multi_category),
     flushFrequencyMs(0),
     msgBufferSize(0),
     useSimpleFile(0) {
@@ -999,7 +1098,7 @@ ThriftFileStore::~ThriftFileStore() {
 }
 
 shared_ptr<Store> ThriftFileStore::copy(const std::string &category) {
-  ThriftFileStore *store = new ThriftFileStore(category, multiCategory);
+  ThriftFileStore *store = new ThriftFileStore(storeQueue, category, multiCategory);
   shared_ptr<Store> copied = shared_ptr<Store>(store);
 
   store->flushFrequencyMs = flushFrequencyMs;
@@ -1010,7 +1109,9 @@ shared_ptr<Store> ThriftFileStore::copy(const std::string &category) {
 
 bool ThriftFileStore::handleMessages(boost::shared_ptr<logentry_vector_t> messages) {
   if (!isOpen()) {
-    return false;
+    if (!open()) {
+      return false;
+    }
   }
 
   unsigned long messages_handled = 0;
@@ -1018,7 +1119,8 @@ bool ThriftFileStore::handleMessages(boost::shared_ptr<logentry_vector_t> messag
        iter != messages->end();
        ++iter) {
 
-    // This length is an estimate -- what the ThriftLogFile actually writes is a black box to us
+    // This length is an estimate -- what the ThriftLogFile actually writes is
+    // a black box to us
     uint32_t length = (*iter)->message.size();
 
     try {
@@ -1026,7 +1128,7 @@ bool ThriftFileStore::handleMessages(boost::shared_ptr<logentry_vector_t> messag
       currentSize += length;
       ++eventsWritten;
       ++messages_handled;
-    } catch (TException te) {
+    } catch (const TException& te) {
       LOG_OPER("[%s] Thrift file store failed to write to file: %s\n", categoryHandled.c_str(), te.what());
       setStatus("File write error");
 
@@ -1055,8 +1157,8 @@ bool ThriftFileStore::isOpen() {
   return thriftFileTransport && thriftFileTransport->isOpen();
 }
 
-void ThriftFileStore::configure(pStoreConf configuration) {
-  FileStoreBase::configure(configuration);
+void ThriftFileStore::configure(pStoreConf configuration, pStoreConf parent) {
+  FileStoreBase::configure(configuration, parent);
   configuration->getUnsigned("flush_frequency_ms", flushFrequencyMs);
   configuration->getUnsigned("msg_buffer_size", msgBufferSize);
   configuration->getUnsigned("use_simple_file", useSimpleFile);
@@ -1081,7 +1183,14 @@ bool ThriftFileStore::openInternal(bool incrementFilename, struct tm* current_ti
     current_time = &timeinfo;
   }
 
-  int suffix = findNewestFile(makeBaseFilename(current_time), current_time);
+  int suffix;
+  try {
+    suffix = findNewestFile(makeBaseFilename(current_time));
+  } catch(const std::exception& e) {
+    LOG_OPER("Exception < %s > in ThriftFileStore::openInternal",
+      e.what());
+    return false;
+  }
 
   if (incrementFilename) {
     ++suffix;
@@ -1133,7 +1242,8 @@ bool ThriftFileStore::openInternal(bool incrementFilename, struct tm* current_ti
       }
     }
 
-    LOG_OPER("[%s] Opened file <%s> for writing", categoryHandled.c_str(), filename.c_str());
+    LOG_OPER("[%s] Opened file <%s> for writing",
+        categoryHandled.c_str(), filename.c_str());
 
     struct stat st;
     if (stat(filename.c_str(), &st) == 0) {
@@ -1144,8 +1254,9 @@ bool ThriftFileStore::openInternal(bool incrementFilename, struct tm* current_ti
     currentFilename = filename;
     eventsWritten = 0;
     setStatus("");
-  } catch (TException te) {
-    LOG_OPER("[%s] Failed to open file <%s> for writing: %s\n", categoryHandled.c_str(), filename.c_str(), te.what());
+  } catch (const TException& te) {
+    LOG_OPER("[%s] Failed to open file <%s> for writing: %s\n",
+        categoryHandled.c_str(), filename.c_str(), te.what());
     setStatus("File open error");
     return false;
   }
@@ -1164,7 +1275,7 @@ bool ThriftFileStore::openInternal(bool incrementFilename, struct tm* current_ti
 bool ThriftFileStore::createFileDirectory () {
   try {
     boost::filesystem::create_directories(filePath);
-  }catch(std::exception const& e) {
+  } catch(const std::exception& e) {
     LOG_OPER("Exception < %s > in ThriftFileStore::createFileDirectory for path %s",
       e.what(),filePath.c_str());
     return false;
@@ -1172,17 +1283,25 @@ bool ThriftFileStore::createFileDirectory () {
   return true;
 }
 
-BufferStore::BufferStore(const string& category, bool multi_category)
-  : Store(category, "buffer", multi_category),
-    maxQueueLength(DEFAULT_BUFFERSTORE_MAX_QUEUE_LENGTH),
+BufferStore::BufferStore(StoreQueue* storeq,
+                        const string& category,
+                        bool multi_category)
+  : Store(storeq, category, "buffer", multi_category),
     bufferSendRate(DEFAULT_BUFFERSTORE_SEND_RATE),
     avgRetryInterval(DEFAULT_BUFFERSTORE_AVG_RETRY_INTERVAL),
     retryIntervalRange(DEFAULT_BUFFERSTORE_RETRY_INTERVAL_RANGE),
     replayBuffer(true),
-    state(DISCONNECTED) {
+    adaptiveBackoff(false),
+    minRetryInterval(DEFAULT_MIN_RETRY),
+    maxRetryInterval(DEFAULT_MAX_RETRY),
+    maxRandomOffset(DEFAULT_RANDOM_OFFSET_RANGE),
+    retryInterval(DEFAULT_MIN_RETRY),
+    numContSuccess(0),
+    state(DISCONNECTED),
+    flushStreaming(false),
+    maxByPassRatio(DEFAULT_BUFFERSTORE_BYPASS_MAXQSIZE_RATIO) {
 
-  lastWriteTime = lastOpenAttempt = time(NULL);
-  retryInterval = getNewRetryInterval();
+    lastOpenAttempt = time(NULL);
 
   // we can't open the client conection until we get configured
 }
@@ -1191,23 +1310,69 @@ BufferStore::~BufferStore() {
 
 }
 
-void BufferStore::configure(pStoreConf configuration) {
+void BufferStore::configure(pStoreConf configuration, pStoreConf parent) {
+  Store::configure(configuration, parent);
 
   // Constructor defaults are fine if these don't exist
-  configuration->getUnsigned("max_queue_length", (unsigned long&) maxQueueLength);
   configuration->getUnsigned("buffer_send_rate", (unsigned long&) bufferSendRate);
-  configuration->getUnsigned("retry_interval", (unsigned long&) avgRetryInterval);
-  configuration->getUnsigned("retry_interval_range", (unsigned long&) retryIntervalRange);
+
+  // Used for linear backoff case
+  configuration->getUnsigned("retry_interval",
+                             (unsigned long&) avgRetryInterval);
+  configuration->getUnsigned("retry_interval_range",
+                             (unsigned long&) retryIntervalRange);
+
+  // Used in case of adaptive backoff
+  // max_random_offset should be some fraction of max_retry_interval
+  // 20% of max_retry_interval should be a decent value
+  // if you are using max_random_offset > max_retry_interval you should
+  // probably not be using adaptive backoff and using retry_interval and
+  // retry_interval_range parameters to do linear backoff instead
+  configuration->getUnsigned("min_retry_interval",
+                             (unsigned long&) minRetryInterval);
+  configuration->getUnsigned("max_retry_interval",
+                             (unsigned long&) maxRetryInterval);
+  configuration->getUnsigned("max_random_offset",
+                             (unsigned long&) maxRandomOffset);
+  if (maxRandomOffset > maxRetryInterval) {
+    LOG_OPER(" Warning max_random_offset > max_retry_interval look at using adaptive_backoff=no instead setting max_random_offset to max_retry_interval");
+    maxRandomOffset = maxRetryInterval;
+  }
 
   string tmp;
   if (configuration->getString("replay_buffer", tmp) && tmp != "yes") {
     replayBuffer = false;
   }
 
+  if (configuration->getString("flush_streaming", tmp) && tmp == "yes") {
+    flushStreaming = true;
+  }
+
+  if (configuration->getString("buffer_bypass_max_ratio", tmp)) {
+    double d = strtod(tmp.c_str(), NULL);
+    if (d > 0 && d <= 1) {
+      maxByPassRatio = d;
+    } else {
+      LOG_OPER("[%s] Bad config - buffer_bypass_max_ratio <%s> range is (0, 1]",
+          categoryHandled.c_str(), tmp.c_str());
+    }
+  }
+
+  if (configuration->getString("adaptive_backoff", tmp) && tmp == "yes") {
+    adaptiveBackoff = true;
+  }
+
   if (retryIntervalRange > avgRetryInterval) {
     LOG_OPER("[%s] Bad config - retry_interval_range must be less than retry_interval. Using <%d> as range instead of <%d>",
-             categoryHandled.c_str(), (int)avgRetryInterval, (int)retryIntervalRange);
+             categoryHandled.c_str(), (int)avgRetryInterval,
+             (int)retryIntervalRange);
     retryIntervalRange = avgRetryInterval;
+  }
+  if (minRetryInterval > maxRetryInterval) {
+    LOG_OPER("[%s] Bad config - min_retry_interval must be less than max_retry_interval. Using <%d> and  <%d>, the default values instead",
+             categoryHandled.c_str(), DEFAULT_MIN_RETRY, DEFAULT_MAX_RETRY );
+    minRetryInterval = DEFAULT_MIN_RETRY;
+    maxRetryInterval = DEFAULT_MAX_RETRY;
   }
 
   pStoreConf secondary_store_conf;
@@ -1223,9 +1388,9 @@ void BufferStore::configure(pStoreConf configuration) {
       cout << msg << endl;
     } else {
       // If replayBuffer is true, then we need to create a readable store
-      secondaryStore = createStore(type, categoryHandled, replayBuffer,
-                                   multiCategory);
-      secondaryStore->configure(secondary_store_conf);
+      secondaryStore = createStore(storeQueue, type, categoryHandled,
+                                   replayBuffer, multiCategory);
+      secondaryStore->configure(secondary_store_conf, storeConf);
     }
   }
 
@@ -1247,18 +1412,21 @@ void BufferStore::configure(pStoreConf configuration) {
       string msg("Bad config - buffer primary store cannot be multistore");
       setStatus(msg);
     } else {
-      primaryStore = createStore(type, categoryHandled, false, multiCategory);
-      primaryStore->configure(primary_store_conf);
+      primaryStore = createStore(storeQueue, type, categoryHandled, false,
+                                  multiCategory);
+      primaryStore->configure(primary_store_conf, storeConf);
     }
   }
 
   // If the config is bad we'll still try to write the data to a
   // default location on local disk.
   if (!secondaryStore) {
-    secondaryStore = createStore("file", categoryHandled, true, multiCategory);
+    secondaryStore = createStore(storeQueue, "file", categoryHandled, true,
+                                multiCategory);
   }
   if (!primaryStore) {
-    primaryStore = createStore("file", categoryHandled, false, multiCategory);
+    primaryStore = createStore(storeQueue, "file", categoryHandled, false,
+                               multiCategory);
   }
 }
 
@@ -1308,14 +1476,19 @@ void BufferStore::flush() {
 }
 
 shared_ptr<Store> BufferStore::copy(const std::string &category) {
-  BufferStore *store = new BufferStore(category, multiCategory);
+  BufferStore *store = new BufferStore(storeQueue, category, multiCategory);
   shared_ptr<Store> copied = shared_ptr<Store>(store);
 
-  store->maxQueueLength = maxQueueLength;
   store->bufferSendRate = bufferSendRate;
   store->avgRetryInterval = avgRetryInterval;
   store->retryIntervalRange = retryIntervalRange;
+  store->retryInterval = retryInterval;
+  store->numContSuccess = numContSuccess;
   store->replayBuffer = replayBuffer;
+  store->minRetryInterval = minRetryInterval;
+  store->maxRetryInterval = maxRetryInterval;
+  store->maxRandomOffset = maxRandomOffset;
+  store->adaptiveBackoff = adaptiveBackoff;
 
   store->primaryStore = primaryStore->copy(category);
   store->secondaryStore = secondaryStore->copy(category);
@@ -1323,17 +1496,12 @@ shared_ptr<Store> BufferStore::copy(const std::string &category) {
 }
 
 bool BufferStore::handleMessages(boost::shared_ptr<logentry_vector_t> messages) {
-  lastWriteTime = time(NULL);
 
-  // If the queue is really long it's probably because the primary store isn't moving
-  // fast enough and is backing up, in which case it's best to give up on it for now.
-  if (state == STREAMING && messages->size() > maxQueueLength) {
-    LOG_OPER("[%s] BufferStore queue backing up, switching to secondary store (%u messages)", categoryHandled.c_str(), (unsigned)messages->size());
-    changeState(DISCONNECTED);
-  }
-
-  if (state == STREAMING) {
+  if (state == STREAMING || (flushStreaming && state == SENDING_BUFFER)) {
     if (primaryStore->handleMessages(messages)) {
+      if (adaptiveBackoff) {
+        setNewRetryInterval(true);
+      }
       return true;
     } else {
       changeState(DISCONNECTED);
@@ -1378,11 +1546,9 @@ void BufferStore::changeState(buffer_state_t new_state) {
     // Do not set status here as it is possible to be in this frequently.
     // Whatever caused us to enter this state should have either set status
     // or chosen not to set status.
-    g_Handler->incrementCounter("retries");
+    g_Handler->incCounter(categoryHandled, "retries");
+    setNewRetryInterval(false);
     lastOpenAttempt = time(NULL);
-    retryInterval = getNewRetryInterval();
-    LOG_OPER("[%s] choosing new retry interval <%d> seconds", categoryHandled.c_str(),
-             (int)retryInterval);
     if (!secondaryStore->isOpen()) {
       secondaryStore->open();
     }
@@ -1396,7 +1562,8 @@ void BufferStore::changeState(buffer_state_t new_state) {
     break;
   }
 
-  LOG_OPER("[%s] Changing state from <%s> to <%s>", categoryHandled.c_str(), stateAsString(state), stateAsString(new_state));
+  LOG_OPER("[%s] Changing state from <%s> to <%s>",
+      categoryHandled.c_str(), stateAsString(state), stateAsString(new_state));
   state = new_state;
 }
 
@@ -1411,9 +1578,7 @@ void BufferStore::periodicCheck() {
   localtime_r(&now, &nowinfo);
 
   if (state == DISCONNECTED) {
-
     if (now - lastOpenAttempt > retryInterval) {
-
       if (primaryStore->open()) {
         // Success.  Check if we need to send buffers from secondary to primary
         if (replayBuffer) {
@@ -1428,71 +1593,162 @@ void BufferStore::periodicCheck() {
     }
   }
 
+  // send data in case of backup
   if (state == SENDING_BUFFER) {
+    // if queue size is getting large return so that there is time to forward
+    // incoming messages directly to the primary store without buffering to
+    // secondary store.
+    if (flushStreaming) {
+      uint64_t qsize = storeQueue->getSize();
+      if(qsize >=
+          maxByPassRatio * g_Handler->getMaxQueueSize()) {
+        return;
+      }
+    }
 
     // Read a group of messages from the secondary store and send them to
     // the primary store. Note that the primary store could tell us to try
     // again later, so this isn't very efficient if it reads too many
     // messages at once. (if the secondary store is a file, the number of
     // messages read is controlled by the max file size)
+    // parameter max_size for filestores in the configuration
     unsigned sent = 0;
-    for (sent = 0; sent < bufferSendRate; ++sent) {
-      boost::shared_ptr<logentry_vector_t> messages(new logentry_vector_t);
-      if (secondaryStore->readOldest(messages, &nowinfo)) {
-        lastWriteTime = time(NULL);
+    try {
+      for (sent = 0; sent < bufferSendRate; ++sent) {
+        boost::shared_ptr<logentry_vector_t> messages(new logentry_vector_t);
+        // Reads come complete buffered file
+        // this file size is controlled by max_size in the configuration
+        if (secondaryStore->readOldest(messages, &nowinfo)) {
 
-        unsigned long size = messages->size();
-        if (size) {
-          if (primaryStore->handleMessages(messages)) {
-            secondaryStore->deleteOldest(&nowinfo);
-          } else {
-
-            if (messages->size() != size) {
-              // We were only able to process some, but not all of this batch
-              // of messages.  Replace this batch of messages with just the messages
-              // that were not processed.
-              LOG_OPER("[%s] buffer store primary store processed %lu/%lu messages",
-                       categoryHandled.c_str(), size - messages->size(), size);
-
-              // Put back un-handled messages
-              if (!secondaryStore->replaceOldest(messages, &nowinfo)) {
-                // Nothing we can do but try to remove oldest messages and report a loss
-                LOG_OPER("[%s] buffer store secondary store lost %lu messages",
-                         categoryHandled.c_str(), messages->size());
-                g_Handler->incrementCounter("lost", messages->size());
-                secondaryStore->deleteOldest(&nowinfo);
+          unsigned long size = messages->size();
+          if (size) {
+            if (primaryStore->handleMessages(messages)) {
+              secondaryStore->deleteOldest(&nowinfo);
+              if (adaptiveBackoff) {
+                setNewRetryInterval(true);
               }
+            } else {
+
+              if (messages->size() != size) {
+                // We were only able to process some, but not all of this batch
+                // of messages.  Replace this batch of messages with
+                // just the messages that were not processed.
+                LOG_OPER("[%s] buffer store primary store processed %lu/%lu messages",
+                    categoryHandled.c_str(), size - messages->size(), size);
+
+                // Put back un-handled messages
+                if (!secondaryStore->replaceOldest(messages, &nowinfo)) {
+                  // Nothing we can do but try to remove oldest messages and
+                  // report a loss
+                  LOG_OPER("[%s] buffer store secondary store lost %lu messages",
+                      categoryHandled.c_str(), messages->size());
+                  g_Handler->incCounter(categoryHandled, "lost", messages->size());
+                  secondaryStore->deleteOldest(&nowinfo);
+                }
+              }
+              changeState(DISCONNECTED);
+              break;
             }
-
-            changeState(DISCONNECTED);
-            break;
+          }  else {
+            // else it's valid for read to not find anything but not error
+            secondaryStore->deleteOldest(&nowinfo);
           }
-        }  else {
-          // else it's valid for read to not find anything but not error
-          secondaryStore->deleteOldest(&nowinfo);
+        } else {
+          // This is bad news. We'll stay in the sending state
+          // and keep trying to read.
+          setStatus("Failed to read from secondary store");
+          LOG_OPER("[%s] WARNING: buffer store can't read from secondary store",
+              categoryHandled.c_str());
+          break;
         }
-      } else {
-        // This is bad news. We'll stay in the sending state and keep trying to read.
-        setStatus("Failed to read from secondary store");
-        LOG_OPER("[%s] WARNING: buffer store can't read from secondary store", categoryHandled.c_str());
-        break;
-      }
 
-      if (secondaryStore->empty(&nowinfo)) {
-        LOG_OPER("[%s] No more buffer files to send, switching to streaming mode", categoryHandled.c_str());
-        changeState(STREAMING);
+        if (secondaryStore->empty(&nowinfo)) {
+          LOG_OPER("[%s] No more buffer files to send, switching to streaming mode",
+              categoryHandled.c_str());
+          changeState(STREAMING);
 
-        primaryStore->flush();
-        break;
+          break;
+        }
       }
+    } catch(const std::exception& e) {
+      LOG_OPER("[%s] Failed in secondary to primary transfer ",
+          categoryHandled.c_str());
+      LOG_OPER("Exception: %s", e.what());
+      setStatus("bufferstore sending_buffer failure");
+      changeState(DISCONNECTED);
     }
   }// if state == SENDING_BUFFER
 }
 
+/*
+ * This functions sets a new time interval after which the buffer store
+ * will retry connecting to primary. There are two modes based on the
+ * config parameter 'adaptive_backoff'.
+ *
+ *
+ * When adaptive_backoff=yes this function uses an Additive Increase and
+ * Multiplicative Decrease strategy which is commonly used in networking
+ * protocols for congestion avoidance, while achieving fairness and good
+ * throughput for multiple senders.
+ * The algorithm works as follows. Whenever the buffer store is able to
+ * achieve CONT_SUCCESS_THRESHOLD continuous successful sends to the
+ * primary store its retry interval is decreased by ADD_DEC_FACTOR.
+ * Whenever the buffer store fails to send to primary its retry interval
+ * is increased by multiplying a MULT_INC_FACTOR to it. To avoid thundering
+ * herds problems a random offset is added to this new retry interval
+ * controlled by 'max_random_offset' config parameter.
+ * The range of the retry interval is controlled by config parameters
+ * 'min_retry_interval' and 'max_retry_interval'.
+ * Currently CONT_SUCCESS_THRESHOLD, ADD_DEC_FACTOR and MULT_INC_FACTOR
+ * are not config parameters. This can be done later if need be.
+ *
+ *
+ * In case adaptive_backoff=no, the new retry interval is calculated
+ * using the config parameters 'avg_retry_interval' and
+ * 'retry_interval_range'
+ */
+void BufferStore::setNewRetryInterval(bool success) {
 
-time_t BufferStore::getNewRetryInterval() {
-  time_t interval = avgRetryInterval - retryIntervalRange/2 + rand() % retryIntervalRange;
-  return interval;
+  if (adaptiveBackoff) {
+    time_t prevRetryInterval = retryInterval;
+    if (success) {
+      numContSuccess++;
+      if (numContSuccess >= CONT_SUCCESS_THRESHOLD) {
+        if (retryInterval > ADD_DEC_FACTOR) {
+          retryInterval -= ADD_DEC_FACTOR;
+        }
+        else {
+          retryInterval = minRetryInterval;
+        }
+        if (retryInterval < minRetryInterval) {
+          retryInterval = minRetryInterval;
+        }
+        numContSuccess = 0;
+      }
+      else {
+        return;
+      }
+    }
+    else {
+      retryInterval = static_cast <time_t> (retryInterval*MULT_INC_FACTOR);
+      retryInterval += (rand() % maxRandomOffset);
+      if (retryInterval > maxRetryInterval) {
+        retryInterval = maxRetryInterval;
+      }
+      numContSuccess = 0;
+    }
+    // prevent unnecessary prints
+    if (prevRetryInterval == retryInterval) {
+      return;
+    }
+  }
+  else {
+    retryInterval = avgRetryInterval - retryIntervalRange/2
+                    + rand() % retryIntervalRange;
+  }
+  LOG_OPER("[%s] choosing new retry interval <%lu> seconds",
+           categoryHandled.c_str(),
+           (unsigned long) retryInterval);
 }
 
 const char* BufferStore::stateAsString(buffer_state_t state) {
@@ -1524,14 +1780,18 @@ std::string BufferStore::getStatus() {
 }
 
 
-NetworkStore::NetworkStore(const string& category, bool multi_category)
-  : Store(category, "network", multi_category),
+NetworkStore::NetworkStore(StoreQueue* storeq,
+                          const string& category,
+                          bool multi_category)
+  : Store(storeq, category, "network", multi_category),
     useConnPool(false),
-    smcBased(false),
+    serviceBased(false),
     remotePort(0),
     serviceCacheTimeout(DEFAULT_NETWORKSTORE_CACHE_TIMEOUT),
-    lastServiceCheck(0),
-    opened(false) {
+    ignoreNetworkError(false),
+    configmod(NULL),
+    opened(false),
+    lastServiceCheck(0) {
   // we can't open the connection until we get configured
 
   // the bool for opened ensures that we don't make duplicate
@@ -1543,17 +1803,18 @@ NetworkStore::~NetworkStore() {
   close();
 }
 
-void NetworkStore::configure(pStoreConf configuration) {
+void NetworkStore::configure(pStoreConf configuration, pStoreConf parent) {
+  Store::configure(configuration, parent);
   // Error checking is done on open()
-  // smc takes precedence over host + port
-  if (configuration->getString("smc_service", smcService)) {
-    smcBased = true;
+  // service takes precedence over host + port
+  if (configuration->getString("smc_service", serviceName)) {
+    serviceBased = true;
 
     // Constructor defaults are fine if these don't exist
     configuration->getString("service_options", serviceOptions);
     configuration->getUnsigned("service_cache_timeout", serviceCacheTimeout);
   } else {
-    smcBased = false;
+    serviceBased = false;
     configuration->getString("remote_host", remoteHost);
     configuration->getUnsigned("remote_port", remotePort);
   }
@@ -1568,11 +1829,68 @@ void NetworkStore::configure(pStoreConf configuration) {
       useConnPool = true;
     }
   }
+  if (configuration->getString("ignore_network_error", temp)) {
+    if (0 == temp.compare("yes")) {
+      ignoreNetworkError = true;
+    }
+  }
+
+  // if this network store dynamic configured?
+  // get network dynamic updater parameters
+  string dynamicType;
+  if (configuration->getString("dynamic_config_type", dynamicType)) {
+    // get dynamic config module
+    configmod = getNetworkDynamicConfigMod(dynamicType.c_str());
+    if (configmod) {
+      if (!configmod->isConfigValidFunc(categoryHandled, configuration.get())) {
+        LOG_OPER("[%s] dynamic network configuration is not valid.",
+                categoryHandled.c_str());
+        configmod = NULL;
+      } else {
+        // set remote host port
+        string host;
+        uint32_t port;
+        if (configmod->getHostFunc(categoryHandled, storeConf.get(), host, port)) {
+          remoteHost = host;
+          remotePort = port;
+          LOG_OPER("[%s] dynamic configred network store destination configured:<%s:%lu>",
+            categoryHandled.c_str(), remoteHost.c_str(), remotePort);
+        }
+      }
+    } else {
+      LOG_OPER("[%s] dynamic network configuration is not valid. Unable to find network dynamic configuration module with name <%s>",
+                categoryHandled.c_str(), dynamicType.c_str());
+    }
+  }
+}
+
+void NetworkStore::periodicCheck() {
+  if (configmod) {
+    // get the network updater type
+    string host;
+    uint32_t port;
+    bool success = configmod->getHostFunc(categoryHandled, storeConf.get(), host, port);
+    if (success && (host != remoteHost || port != remotePort)) {
+      // if it is different from the current configuration
+      // then close and open again
+      LOG_OPER("[%s] dynamic configred network store destination changed. old value:<%s:%lu>, new value:<%s:%lu>",
+               categoryHandled.c_str(), remoteHost.c_str(), remotePort,
+               host.c_str(), (long unsigned)port);
+      remoteHost = host;
+      remotePort = port;
+      close();
+    }
+  }
 }
 
 bool NetworkStore::open() {
-
-  if (smcBased) {
+  if (isOpen()) {
+    /* re-opening an already open NetworkStore can be bad. For example,
+     * it can lead to bad reference counting on g_connpool connections
+     */
+    return (true);
+  }
+  if (serviceBased) {
     bool success = true;
     time_t now = time(NULL);
 
@@ -1580,57 +1898,58 @@ bool NetworkStore::open() {
     if (lastServiceCheck <= (time_t) (now - serviceCacheTimeout)) {
       lastServiceCheck = now;
 
-      success =
-        network_config::getService(smcService, serviceOptions, servers);
+      success = scribe::network_config::getService(serviceName, serviceOptions,
+                                                   servers);
     }
 
     // Cannot open if we couldn't find any servers
     if (!success || servers.empty()) {
-      LOG_OPER("[%s] Failed to get servers from smc", categoryHandled.c_str());
-      setStatus("Could not get list of servers from smc");
+      LOG_OPER("[%s] Failed to get servers from service", categoryHandled.c_str());
+      setStatus("Could not get list of servers from service");
       return false;
     }
 
     if (useConnPool) {
-      opened = g_connPool.open(smcService, servers, static_cast<int>(timeout));
+      opened = g_connPool.open(serviceName, servers, static_cast<int>(timeout));
     } else {
-      // only open unpooled connection if not already open
-      if (unpooledConn == NULL) {
-        unpooledConn = shared_ptr<scribeConn>(new scribeConn(smcService, servers, static_cast<int>(timeout)));
-        opened = unpooledConn->open();
-      } else {
-        opened = unpooledConn->isOpen();
-        if (!opened) {
-          opened = unpooledConn->open();
-        }
+      if (unpooledConn != NULL) {
+        LOG_OPER("Logic error: NetworkStore::open unpooledConn is not NULL"
+            " service = %s", serviceName.c_str());
+      }
+      unpooledConn = shared_ptr<scribeConn>(new scribeConn(serviceName,
+            servers, static_cast<int>(timeout)));
+      opened = unpooledConn->open();
+      if (!opened) {
+        unpooledConn.reset();
       }
     }
 
-  } else if (remotePort <= 0 ||
-             remoteHost.empty()) {
-    LOG_OPER("[%s] Bad config - won't attempt to connect to <%s:%lu>", categoryHandled.c_str(), remoteHost.c_str(), remotePort);
+  } else if (remotePort <= 0 || remoteHost.empty()) {
+    LOG_OPER("[%s] Bad config - won't attempt to connect to <%s:%lu>",
+        categoryHandled.c_str(), remoteHost.c_str(), remotePort);
     setStatus("Bad config - invalid location for remote server");
     return false;
-
   } else {
     if (useConnPool) {
-      opened = g_connPool.open(remoteHost, remotePort, static_cast<int>(timeout));
+      opened = g_connPool.open(remoteHost, remotePort,
+          static_cast<int>(timeout));
     } else {
       // only open unpooled connection if not already open
-      if (unpooledConn == NULL) {
-        unpooledConn = shared_ptr<scribeConn>(new scribeConn(remoteHost, remotePort, static_cast<int>(timeout)));
-        opened = unpooledConn->open();
-      } else {
-        opened = unpooledConn->isOpen();
-        if (!opened) {
-          opened = unpooledConn->open();
-        }
+      if (unpooledConn != NULL) {
+        LOG_OPER("Logic error: NetworkStore::open unpooledConn is not NULL"
+            " %s:%lu", remoteHost.c_str(), remotePort);
+      }
+      unpooledConn = shared_ptr<scribeConn>(new scribeConn(remoteHost,
+          remotePort, static_cast<int>(timeout)));
+      opened = unpooledConn->open();
+      if (!opened) {
+        unpooledConn.reset();
       }
     }
   }
 
-
-  if (opened) {
+  if (opened || ignoreNetworkError) {
+    // clear status on success or if we should not signal error here
     setStatus("");
   } else {
     setStatus("Failed to connect");
@@ -1644,8 +1963,8 @@ void NetworkStore::close() {
   }
   opened = false;
   if (useConnPool) {
-    if (smcBased) {
-      g_connPool.close(smcService);
+    if (serviceBased) {
+      g_connPool.close(serviceName);
     } else {
       g_connPool.close(remoteHost, remotePort);
     }
@@ -1653,6 +1972,7 @@ void NetworkStore::close() {
     if (unpooledConn != NULL) {
       unpooledConn->close();
     }
+    unpooledConn.reset();
   }
 }
 
@@ -1661,45 +1981,74 @@ bool NetworkStore::isOpen() {
 }
 
 shared_ptr<Store> NetworkStore::copy(const std::string &category) {
-  NetworkStore *store = new NetworkStore(category, multiCategory);
+  NetworkStore *store = new NetworkStore(storeQueue, category, multiCategory);
   shared_ptr<Store> copied = shared_ptr<Store>(store);
 
   store->useConnPool = useConnPool;
-  store->smcBased = smcBased;
+  store->serviceBased = serviceBased;
   store->timeout = timeout;
   store->remoteHost = remoteHost;
   store->remotePort = remotePort;
-  store->smcService = smcService;
+  store->serviceName = serviceName;
 
   return copied;
 }
 
-bool NetworkStore::handleMessages(boost::shared_ptr<logentry_vector_t> messages) {
+
+// If the size of messages is greater than a threshold
+// first try sending an empty vector to catch dfqs
+bool
+NetworkStore::handleMessages(boost::shared_ptr<logentry_vector_t> messages) {
+  int ret;
+
   if (!isOpen()) {
-    LOG_OPER("[%s] Logic error: NetworkStore::handleMessages called on closed store", categoryHandled.c_str());
+    if (!open()) {
+    LOG_OPER("[%s] Could not open NetworkStore in handleMessages",
+             categoryHandled.c_str());
     return false;
-  } else if (useConnPool) {
-    if (smcBased) {
-      return g_connPool.send(smcService, messages);
-    } else {
-      return g_connPool.send(remoteHost, remotePort, messages);
-    }
-  } else {
-    if (unpooledConn) {
-      return unpooledConn->send(messages);
-    } else {
-      LOG_OPER("[%s] Logic error: NetworkStore::handleMessages unpooledConn is NULL", categoryHandled.c_str());
-      return false;
     }
   }
+
+  bool tryDummySend = shouldSendDummy(messages);
+  boost::shared_ptr<logentry_vector_t> dummymessages(new logentry_vector_t);
+
+  if (useConnPool) {
+    if (serviceBased) {
+      if (!tryDummySend ||
+          ((ret = g_connPool.send(serviceName, dummymessages)) == CONN_OK)) {
+        ret = g_connPool.send(serviceName, messages);
+      }
+    } else {
+      if (!tryDummySend ||
+          (ret = g_connPool.send(remoteHost, remotePort, dummymessages)) ==
+          CONN_OK) {
+        ret = g_connPool.send(remoteHost, remotePort, messages);
+      }
+    }
+  } else if (unpooledConn) {
+    if (!tryDummySend ||
+        ((ret = unpooledConn->send(dummymessages)) == CONN_OK)) {
+      ret = unpooledConn->send(messages);
+    }
+  } else {
+    ret = CONN_FATAL;
+    LOG_OPER("[%s] Logic error: NetworkStore::handleMessages unpooledConn "
+        "is NULL", categoryHandled.c_str());
+  }
+  if (ret == CONN_FATAL) {
+    close();
+  }
+  return (ret == CONN_OK);
 }
 
 void NetworkStore::flush() {
   // Nothing to do
 }
 
-BucketStore::BucketStore(const string& category, bool multi_category)
-  : Store(category, "bucket", multi_category),
+BucketStore::BucketStore(StoreQueue* storeq,
+                        const string& category,
+                        bool multi_category)
+  : Store(storeq, category, "bucket", multi_category),
     bucketType(context_log),
     delimiter(DEFAULT_BUCKETSTORE_DELIMITER),
     removeKey(false),
@@ -1714,7 +2063,7 @@ BucketStore::~BucketStore() {
 
 // Given a single bucket definition, create multiple buckets
 void BucketStore::createBucketsFromBucket(pStoreConf configuration,
-					  pStoreConf bucket_conf) {
+    pStoreConf bucket_conf) {
   string error_msg, bucket_subdir, type, path, failure_bucket;
   bool needs_bucket_subdir = false;
   unsigned long bucket_offset = 0;
@@ -1759,7 +2108,7 @@ void BucketStore::createBucketsFromBucket(pStoreConf configuration,
   for (unsigned int i = 0; i <= numBuckets; ++i) {
 
     shared_ptr<Store> newstore =
-      createStore(type, categoryHandled, false, multiCategory);
+      createStore(storeQueue, type, categoryHandled, false, multiCategory);
 
     if (!newstore) {
       error_msg = "can't create store of type: ";
@@ -1783,7 +2132,7 @@ void BucketStore::createBucketsFromBucket(pStoreConf configuration,
     }
 
     buckets.push_back(newstore);
-    newstore->configure(bucket_conf);
+    newstore->configure(bucket_conf, storeConf);
   }
 
   return;
@@ -1804,21 +2153,18 @@ void BucketStore::createBuckets(pStoreConf configuration) {
   unsigned long i;
 
   if (configuration->getString("bucket_subdir", tmp_string)) {
-    error_msg =
-      "cannot have bucket_subdir when defining multiple buckets";
-      goto handle_error;
+    error_msg = "cannot have bucket_subdir when defining multiple buckets";
+    goto handle_error;
   }
 
   if (configuration->getString("bucket_offset", tmp_string)) {
-    error_msg =
-      "cannot have bucket_offset when defining multiple buckets";
-      goto handle_error;
+    error_msg = "cannot have bucket_offset when defining multiple buckets";
+    goto handle_error;
   }
 
   if (configuration->getString("failure_bucket", tmp_string)) {
-    error_msg =
-      "cannot have failure_bucket when defining multiple buckets";
-      goto handle_error;
+    error_msg = "cannot have failure_bucket when defining multiple buckets";
+    goto handle_error;
   }
 
   // Configure stores named 'bucket0, bucket1, bucket2, ... bucket{numBuckets}
@@ -1831,22 +2177,26 @@ void BucketStore::createBuckets(pStoreConf configuration) {
     bucket_name = ss.str();
 
     if (!configuration->getStore(bucket_name, bucket_conf)) {
-      error_msg = "could not find bucket definition for " +
-	bucket_name;
+      error_msg = "could not find bucket definition for " + bucket_name;
       goto handle_error;
     }
 
     if (!bucket_conf->getString("type", type)) {
-      error_msg =
-	"store contained in a bucket store must have a type";
+      error_msg = "store contained in a bucket store must have a type";
       goto handle_error;
     }
 
     shared_ptr<Store> bucket =
-      createStore(type, categoryHandled, false, multiCategory);
+      createStore(storeQueue, type, categoryHandled, false, multiCategory);
 
     buckets.push_back(bucket);
-    bucket->configure(bucket_conf);
+    //add bucket id configuration
+    bucket_conf->setUnsigned("bucket_id", i);
+    bucket_conf->setUnsigned("network::bucket_id", i);
+    bucket_conf->setUnsigned("file::bucket_id", i);
+    bucket_conf->setUnsigned("thriftfile::bucket_id", i);
+    bucket_conf->setUnsigned("buffer::bucket_id", i);
+    bucket->configure(bucket_conf, storeConf);
   }
 
   // Check if an extra bucket is defined
@@ -1898,7 +2248,8 @@ handle_error:
    *   </bucket>
    * </store>
    */
-void BucketStore::configure(pStoreConf configuration) {
+void BucketStore::configure(pStoreConf configuration, pStoreConf parent) {
+  Store::configure(configuration, parent);
 
   string error_msg, bucketizer_str, remove_key_str;
   unsigned long delim_long = 0;
@@ -2034,16 +2385,24 @@ string BucketStore::getStatus() {
   return retval;
 }
 
+// Call periodicCheck on all containing stores
 void BucketStore::periodicCheck() {
-  for (std::vector<shared_ptr<Store> >::iterator iter = buckets.begin();
-       iter != buckets.end();
-       ++iter) {
-    (*iter)->periodicCheck();
+  // Call periodic check on all bucket stores in a random order
+  uint32_t sz = buckets.size();
+  vector<uint32_t> storeIndex(sz);
+  for (uint32_t i = 0; i < sz; ++i) {
+    storeIndex[i] = i;
+  }
+  random_shuffle(storeIndex.begin(), storeIndex.end());
+
+  for (uint32_t i = 0; i < sz; ++i) {
+    uint32_t idx = storeIndex[i];
+    buckets[idx]->periodicCheck();
   }
 }
 
 shared_ptr<Store> BucketStore::copy(const std::string &category) {
-  BucketStore *store = new BucketStore(category, multiCategory);
+  BucketStore *store = new BucketStore(storeQueue, category, multiCategory);
   shared_ptr<Store> copied = shared_ptr<Store>(store);
 
   store->numBuckets = numBuckets;
@@ -2059,6 +2418,12 @@ shared_ptr<Store> BucketStore::copy(const std::string &category) {
   return copied;
 }
 
+/*
+ * Bucketize <messages> and try to send to each contained bucket store
+ * At the end of the function <messages> will contain all the messages that
+ * could not be processed
+ * Returns true if all messages were successfully sent, false otherwise.
+ */
 bool BucketStore::handleMessages(boost::shared_ptr<logentry_vector_t> messages) {
   bool success = true;
 
@@ -2127,6 +2492,7 @@ bool BucketStore::handleMessages(boost::shared_ptr<logentry_vector_t> messages) 
   return success;
 }
 
+// Return the bucket number a message must be put into
 unsigned long BucketStore::bucketize(const std::string& message) {
 
   string::size_type length = message.length();
@@ -2154,7 +2520,7 @@ unsigned long BucketStore::bucketize(const std::string& message) {
     if (numBuckets == 0) {
       return 0;
     } else {
-      return (integerhash::hash32(id) % numBuckets) + 1;
+      return (scribe::integerhash::hash32(id) % numBuckets) + 1;
     }
   } else if (bucketType == random) {
     // return any random bucket
@@ -2194,7 +2560,7 @@ unsigned long BucketStore::bucketize(const std::string& message) {
         case key_hash:
         default:
           // Hashing by default.
-          return (strhash::hash32(key.c_str()) % numBuckets) + 1;
+          return (scribe::strhash::hash32(key.c_str()) % numBuckets) + 1;
           break;
       }
     }
@@ -2214,15 +2580,17 @@ string BucketStore::getMessageWithoutKey(const std::string& message) {
 }
 
 
-NullStore::NullStore(const std::string& category, bool multi_category)
-  : Store(category, "null", multi_category)
+NullStore::NullStore(StoreQueue* storeq,
+                     const std::string& category,
+                     bool multi_category)
+  : Store(storeq, category, "null", multi_category)
 {}
 
 NullStore::~NullStore() {
 }
 
 boost::shared_ptr<Store> NullStore::copy(const std::string &category) {
-  NullStore *store = new NullStore(category, multiCategory);
+  NullStore *store = new NullStore(storeQueue, category, multiCategory);
   shared_ptr<Store> copied = shared_ptr<Store>(store);
   return copied;
 }
@@ -2235,14 +2603,15 @@ bool NullStore::isOpen() {
   return true;
 }
 
-void NullStore::configure(pStoreConf) {
+void NullStore::configure(pStoreConf configuration, pStoreConf parent) {
+  Store::configure(configuration, parent);
 }
 
 void NullStore::close() {
 }
 
 bool NullStore::handleMessages(boost::shared_ptr<logentry_vector_t> messages) {
-  g_Handler->incrementCounter("ignored", messages->size());
+  g_Handler->incCounter(categoryHandled, "ignored", messages->size());
   return true;
 }
 
@@ -2266,15 +2635,17 @@ bool NullStore::empty(struct tm* now) {
   return true;
 }
 
-MultiStore::MultiStore(const std::string& category, bool multi_category)
-  : Store(category, "multi", multi_category) {
+MultiStore::MultiStore(StoreQueue* storeq,
+                      const std::string& category,
+                      bool multi_category)
+  : Store(storeq, category, "multi", multi_category) {
 }
 
 MultiStore::~MultiStore() {
 }
 
 boost::shared_ptr<Store> MultiStore::copy(const std::string &category) {
-  MultiStore *store = new MultiStore(category, multiCategory);
+  MultiStore *store = new MultiStore(storeQueue, category, multiCategory);
   store->report_success = this->report_success;
   boost::shared_ptr<Store> tmp_copy;
   for (std::vector<boost::shared_ptr<Store> >::iterator iter = stores.begin();
@@ -2315,7 +2686,8 @@ bool MultiStore::isOpen() {
   return (report_success == SUCCESS_ALL) ? all_result : any_result;
 }
 
-void MultiStore::configure(pStoreConf configuration) {
+void MultiStore::configure(pStoreConf configuration, pStoreConf parent) {
+  Store::configure(configuration, parent);
   /**
    * in this store, we look for other numbered stores
    * in the following fashion:
@@ -2376,10 +2748,11 @@ void MultiStore::configure(pStoreConf configuration) {
         return;
       } else {
         // add it to the list
-        cur_store = createStore(cur_type, categoryHandled, false, multiCategory);
+        cur_store = createStore(storeQueue, cur_type, categoryHandled, false,
+                                multiCategory);
         LOG_OPER("[%s] MULTI: Configured store of type %s successfully.",
                  categoryHandled.c_str(), cur_type.c_str());
-        cur_store->configure(cur_conf);
+        cur_store->configure(cur_conf, storeConf);
         stores.push_back(cur_store);
       }
     }
@@ -2417,6 +2790,7 @@ bool MultiStore::handleMessages(boost::shared_ptr<logentry_vector_t> messages) {
   return (report_success == SUCCESS_ALL) ? all_result : any_result;
 }
 
+// Call periodicCheck on all contained stores
 void MultiStore::periodicCheck() {
   for (std::vector<boost::shared_ptr<Store> >::iterator iter = stores.begin();
        iter != stores.end();
@@ -2433,20 +2807,23 @@ void MultiStore::flush() {
   }
 }
 
-CategoryStore::CategoryStore(const std::string& category, bool multiCategory)
-  : Store(category, "category", multiCategory) {
+CategoryStore::CategoryStore(StoreQueue* storeq,
+                             const std::string& category,
+                             bool multiCategory)
+  : Store(storeq, category, "category", multiCategory) {
 }
 
-CategoryStore::CategoryStore(const std::string& category,
+CategoryStore::CategoryStore(StoreQueue* storeq,
+                             const std::string& category,
                              const std::string& name, bool multiCategory)
-  : Store(category, name, multiCategory) {
+  : Store(storeq, category, name, multiCategory) {
 }
 
 CategoryStore::~CategoryStore() {
 }
 
 boost::shared_ptr<Store> CategoryStore::copy(const std::string &category) {
-  CategoryStore *store = new CategoryStore(category, multiCategory);
+  CategoryStore *store = new CategoryStore(storeQueue, category, multiCategory);
 
   store->modelStore = modelStore->copy(category);
 
@@ -2478,7 +2855,8 @@ bool CategoryStore::isOpen() {
   return true;
 }
 
-void CategoryStore::configure(pStoreConf configuration) {
+void CategoryStore::configure(pStoreConf configuration, pStoreConf parent) {
+  Store::configure(configuration, parent);
   /**
    *  Parse the store defined and use this store as a model to create a
    *  new store for every new category we see later.
@@ -2507,17 +2885,19 @@ void CategoryStore::configure(pStoreConf configuration) {
       return;
     }
 
-    configureCommon(cur_conf, cur_type);
+    configureCommon(cur_conf, parent, cur_type);
   }
 }
 
 void CategoryStore::configureCommon(pStoreConf configuration,
+                                    pStoreConf parent,
                                     const string type) {
+  Store::configure(configuration, parent);
   // initialize model store
-  modelStore = createStore(type, categoryHandled, false, false);
+  modelStore = createStore(storeQueue, type, categoryHandled, false, false);
   LOG_OPER("[%s] %s: Configured store of type %s successfully.",
            categoryHandled.c_str(), getType().c_str(), type.c_str());
-  modelStore->configure(configuration);
+  modelStore->configure(configuration, parent);
 }
 
 void CategoryStore::close() {
@@ -2595,25 +2975,28 @@ void CategoryStore::flush() {
   }
 }
 
-MultiFileStore::MultiFileStore(const std::string& category, bool multi_category)
-  : CategoryStore(category, "MultiFileStore", multi_category) {
+MultiFileStore::MultiFileStore(StoreQueue* storeq,
+                               const std::string& category,
+                               bool multi_category)
+  : CategoryStore(storeq, category, "MultiFileStore", multi_category) {
 }
 
 MultiFileStore::~MultiFileStore() {
 }
 
-void MultiFileStore::configure(pStoreConf configuration) {
-  configureCommon(configuration, "file");
+void MultiFileStore::configure(pStoreConf configuration, pStoreConf parent) {
+  configureCommon(configuration, parent, "file");
 }
 
-ThriftMultiFileStore::ThriftMultiFileStore(const std::string& category,
+ThriftMultiFileStore::ThriftMultiFileStore(StoreQueue* storeq,
+                                          const std::string& category,
                                            bool multi_category)
-  : CategoryStore(category, "ThriftMultiFileStore", multi_category) {
+  : CategoryStore(storeq, category, "ThriftMultiFileStore", multi_category) {
 }
 
 ThriftMultiFileStore::~ThriftMultiFileStore() {
 }
 
-void ThriftMultiFileStore::configure(pStoreConf configuration) {
-  configureCommon(configuration, "thriftfile");
+void ThriftMultiFileStore::configure(pStoreConf configuration, pStoreConf parent) {
+  configureCommon(configuration, parent, "thriftfile");
 }
