@@ -1185,7 +1185,7 @@ bool ThriftFileStore::openInternal(bool incrementFilename, struct tm* current_ti
 
   int suffix;
   try {
-    suffix = findNewestFile(makeBaseFilename(current_time));
+    suffix = findNewestFile(makeBaseFilename(current_time), current_time);
   } catch(const std::exception& e) {
     LOG_OPER("Exception < %s > in ThriftFileStore::openInternal",
       e.what());
